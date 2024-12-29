@@ -1,9 +1,8 @@
 import gleam/deque
 import gleam/dict.{type Dict}
-import gleam/erlang/charlist.{type Charlist}
+import gleam/dynamic
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/function
-import gleam/io
 import gleam/list
 import gleam/otp/actor
 import gleam/result
@@ -12,16 +11,21 @@ import logging
 
 // ---- Pool config ----- //
 
+/// The strategy used to check out a resource from the pool.
 pub type CheckoutStrategy {
   FIFO
   LIFO
 }
 
+/// How to create resources in the pool. `Lazy` will create resources when
+/// required (i.e. the pool is empty but has extra capacity), while `Eager` will
+/// create the maximum number of resources upfront.
 pub type CreationStrategy {
   Lazy
   Eager
 }
 
+/// Configuration for a [`Pool`](#Pool).
 pub opaque type PoolConfig(resource_type, resource_create_error) {
   PoolConfig(
     size: Int,
@@ -32,18 +36,42 @@ pub opaque type PoolConfig(resource_type, resource_create_error) {
   )
 }
 
+/// Create a new [`PoolConfig`](#PoolConfig) for creating a pool of resources.
+///
+/// ```gleam
+/// import bath
+/// import fake_db
+///
+/// pub fn main() {
+///   // Create a pool of 10 connections to some fictional database.
+///   let assert Ok(pool) =
+///     bath.new(fn() { fake_db.connect() })
+///     |> bath.with_size(10)
+///     |> bath.start(1000)
+/// }
+/// ```
+///
+/// ### Default values
+///
+/// | Config | Default |
+/// |--------|---------|
+/// | `size`   | 10      |
+/// | `shutdown_resource` | `fn(_resource) { Nil }` |
+/// | `checkout_strategy` | `FIFO` |
+/// | `creation_strategy` | `Lazy` |
 pub fn new(
   resource create_resource: fn() -> Result(resource_type, resource_create_error),
 ) -> PoolConfig(resource_type, resource_create_error) {
   PoolConfig(
     size: 10,
-    create_resource: create_resource,
+    create_resource:,
     shutdown_resource: fn(_) { Nil },
     checkout_strategy: FIFO,
     creation_strategy: Lazy,
   )
 }
 
+/// Set the pool size. Defaults to 10.
 pub fn with_size(
   config pool_config: PoolConfig(resource_type, resource_create_error),
   size size: Int,
@@ -51,6 +79,7 @@ pub fn with_size(
   PoolConfig(..pool_config, size:)
 }
 
+/// Set a shutdown function to be run for each resource when the pool exits.
 pub fn with_shutdown(
   config pool_config: PoolConfig(resource_type, resource_create_error),
   shutdown shutdown_resource: fn(resource_type) -> Nil,
@@ -58,6 +87,7 @@ pub fn with_shutdown(
   PoolConfig(..pool_config, shutdown_resource:)
 }
 
+/// Change the checkout strategy for the pool. Defaults to `FIFO`.
 pub fn with_checkout_strategy(
   config pool_config: PoolConfig(resource_type, resource_create_error),
   strategy checkout_strategy: CheckoutStrategy,
@@ -65,6 +95,7 @@ pub fn with_checkout_strategy(
   PoolConfig(..pool_config, checkout_strategy:)
 }
 
+/// Change the resource creation strategy for the pool. Defaults to `Lazy`.
 pub fn with_creation_strategy(
   config pool_config: PoolConfig(resource_type, resource_create_error),
   strategy creation_strategy: CreationStrategy,
@@ -74,17 +105,34 @@ pub fn with_creation_strategy(
 
 // ----- Lifecycle functions ---- //
 
+/// An error returned when creating a [`Pool`](#Pool).
 pub type StartError(resource_create_error) {
   PoolStartResourceCreateError(resource_create_error)
   ActorStartError(actor.StartError)
 }
 
+/// An error returned when failing to apply a function to a pooled resource.
 pub type ApplyError(resource_create_error) {
   NoResourcesAvailable
   CheckOutResourceCreateError(resource_create_error)
   CheckOutTimeout
 }
 
+/// An error returned when the resource pool fails to shut down.
+pub type ShutdownError {
+  /// There are still resources checked out. Ignore this failure case by
+  /// calling [`force_shutdown`](#force_shutdown) function.
+  ResourcesInUse
+  /// The shutdown timeout expired.
+  ShutdownTimeout
+  /// The pool was already down or failed to send the response message.
+  CalleeDown(reason: dynamic.Dynamic)
+}
+
+/// Create a child actor spec pool actor, for use in your application's supervision tree,
+/// using the given [`PoolConfig`](#PoolConfig). Once the pool is started, use
+/// [`from_subject`](#from_subject) to create a [`Pool`](#Pool) from the
+/// `Subject(bath.Msg)`.
 pub fn child_spec(
   config pool_config: PoolConfig(resource_type, resource_create_error),
   timeout init_timeout: Int,
@@ -111,6 +159,17 @@ pub fn child_spec(
   Ok(pool_spec(pool_config, resources, current_size, init_timeout))
 }
 
+/// Create a [`Pool`](#Pool) from a `Subject(bath.Msg)`. Useful when
+/// creating a pool as part of a supervision tree via the
+/// [`child_spec`](#child_spec) function.
+pub fn from_subject(
+  subject: Subject(Msg(resource_type, resource_create_error)),
+) -> Pool(resource_type, resource_create_error) {
+  Pool(subject:)
+}
+
+/// Start a  pool actor using the given [`PoolConfig`](#PoolConfig) and return a
+/// [`Pool`](#Pool).
 pub fn start(
   config pool_config: PoolConfig(resource_type, resource_create_error),
   timeout init_timeout: Int,
@@ -146,6 +205,17 @@ fn check_in(
   process.send(pool.subject, CheckIn(resource:, caller:))
 }
 
+/// Check out a resource from the pool, apply the `next` function, then check
+/// the resource back in.
+///
+/// ```gleam
+/// let assert Ok(pool) =
+///   bath.new(fn() { Ok("Some pooled resource") })
+///   |> bath.start(1000)
+///
+/// use resource <- bath.apply(pool, 1000)
+/// // Do stuff with resource...
+/// ```
 pub fn apply(
   pool: Pool(resource_type, resource_create_error),
   timeout: Int,
@@ -161,16 +231,36 @@ pub fn apply(
   Ok(usage_result)
 }
 
-pub fn shutdown(pool: Pool(resource_type, resource_create_error)) {
-  process.send_exit(pool.subject |> process.subject_owner)
+/// Shut down the pool, calling the `shutdown_function` on each
+/// resource in the pool. Calling with `force` set to `True` will
+/// force the shutdown, not calling the `shutdown_function` on any
+/// resources.
+///
+/// Will fail if there are still resources checked out, unless `force` is
+/// `True`.
+pub fn shutdown(
+  pool: Pool(resource_type, resource_create_error),
+  force: Bool,
+  timeout: Int,
+) {
+  process.try_call(pool.subject, Shutdown(_, force), timeout)
+  |> result.map_error(fn(err) {
+    case err {
+      process.CallTimeout -> ShutdownTimeout
+      process.CalleeDown(reason) -> CalleeDown(reason:)
+    }
+  })
+  |> result.flatten
 }
 
 // ----- Pool ----- //
 
+/// The interface for interacting with a pool of resources in Bath.
 pub opaque type Pool(resource_type, resource_create_error) {
   Pool(subject: Subject(Msg(resource_type, resource_create_error)))
 }
 
+/// Pool actor state.
 pub opaque type State(resource_type, resource_create_error) {
   State(
     // Config
@@ -194,6 +284,7 @@ type LiveResource(resource_type) {
   LiveResource(resource: resource_type, monitor: process.ProcessMonitor)
 }
 
+/// A message sent to the pool actor.
 pub opaque type Msg(resource_type, resource_create_error) {
   CheckIn(resource: resource_type, caller: Pid)
   CheckOut(
@@ -202,6 +293,7 @@ pub opaque type Msg(resource_type, resource_create_error) {
   )
   PoolExit(process.ExitMessage)
   CallerDown(process.ProcessDown)
+  Shutdown(reply_to: process.Subject(Result(Nil, ShutdownError)), force: Bool)
 }
 
 fn handle_pool_message(
@@ -306,6 +398,28 @@ fn handle_pool_message(
 
       actor.Stop(exit_message.reason)
     }
+    Shutdown(reply_to:, force:) -> {
+      case dict.size(state.live_resources), force {
+        // No live resource, shut down
+        0, _ -> {
+          state.resources
+          |> deque.to_list
+          |> list.each(state.shutdown_resource)
+
+          actor.send(reply_to, Ok(Nil))
+          actor.Stop(process.Normal)
+        }
+        _, True -> {
+          // Force shutdown
+          actor.send(reply_to, Ok(Nil))
+          actor.Stop(process.Normal)
+        }
+        _, False -> {
+          actor.send(reply_to, Error(ResourcesInUse))
+          actor.continue(state)
+        }
+      }
+    }
     CallerDown(process_down) -> {
       // If the caller was a live resource, either create a new one or
       // decrement the current size depending on the creation strategy
@@ -316,6 +430,9 @@ fn handle_pool_message(
           // Demonitor the process
           let selector =
             demonitor_process(state.selector, live_resource.monitor)
+
+          // Shutdown the old resource
+          state.shutdown_resource(live_resource.resource)
 
           let #(new_resources, new_current_size) = case
             state.creation_strategy
