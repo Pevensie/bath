@@ -121,7 +121,7 @@ pub type ApplyError(resource_create_error) {
 /// An error returned when the resource pool fails to shut down.
 pub type ShutdownError {
   /// There are still resources checked out. Ignore this failure case by
-  /// calling [`force_shutdown`](#force_shutdown) function.
+  /// calling [`shutdown`](#shutdown) function with `force` set to `True`.
   ResourcesInUse
   /// The shutdown timeout expired.
   ShutdownTimeout
@@ -132,7 +132,7 @@ pub type ShutdownError {
 /// Create a child actor spec pool actor, for use in your application's supervision tree,
 /// using the given [`PoolConfig`](#PoolConfig). Once the pool is started, use
 /// [`from_subject`](#from_subject) to create a [`Pool`](#Pool) from the
-/// `Subject(bath.Msg)`.
+/// `Subject(bath.Msg(a, b))`.
 pub fn child_spec(
   config pool_config: PoolConfig(resource_type, resource_create_error),
   timeout init_timeout: Int,
@@ -159,11 +159,11 @@ pub fn child_spec(
   Ok(pool_spec(pool_config, resources, current_size, init_timeout))
 }
 
-/// Create a [`Pool`](#Pool) from a `Subject(bath.Msg)`. Useful when
+/// Create a [`Pool`](#Pool) from a `Subject(bath.Msg(a, b))`. Useful when
 /// creating a pool as part of a supervision tree via the
 /// [`child_spec`](#child_spec) function.
 pub fn from_subject(
-  subject: Subject(Msg(resource_type, resource_create_error)),
+  subject subject: Subject(Msg(resource_type, resource_create_error)),
 ) -> Pool(resource_type, resource_create_error) {
   Pool(subject:)
 }
@@ -217,9 +217,9 @@ fn check_in(
 /// // Do stuff with resource...
 /// ```
 pub fn apply(
-  pool: Pool(resource_type, resource_create_error),
-  timeout: Int,
-  next: fn(resource_type) -> result_type,
+  pool pool: Pool(resource_type, resource_create_error),
+  timeout timeout: Int,
+  next next: fn(resource_type) -> result_type,
 ) -> Result(result_type, ApplyError(resource_create_error)) {
   let self = process.self()
   use resource <- result.try(check_out(pool, self, timeout))
@@ -239,9 +239,9 @@ pub fn apply(
 /// Will fail if there are still resources checked out, unless `force` is
 /// `True`.
 pub fn shutdown(
-  pool: Pool(resource_type, resource_create_error),
-  force: Bool,
-  timeout: Int,
+  pool pool: Pool(resource_type, resource_create_error),
+  force force: Bool,
+  timeout timeout: Int,
 ) {
   process.try_call(pool.subject, Shutdown(_, force), timeout)
   |> result.map_error(fn(err) {
