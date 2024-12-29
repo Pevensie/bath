@@ -9,7 +9,7 @@ any value, such as database connections, file handles, or other resources.
 ## Installation
 
 ```sh
-gleam add bath@1
+gleam add bath@2
 ```
 
 ## Usage
@@ -20,7 +20,11 @@ import fake_db
 
 pub fn main() {
   // Create a pool of 10 connections to some fictional database.
-  let assert Ok(pool) = bath.init(10, fn() { fake_db.connect() })
+  let assert Ok(pool) =
+    bath.new(fn() { fake_db.connect() })
+    |> bath.with_size(10)
+    |> bath.with_shutdown(fn(conn) { fake_db.close(conn) })
+    |> bath.start(1000)
 
   // Use the pool. Shown here in a block to use `use`.
   let assert Ok("Hello!") = {
