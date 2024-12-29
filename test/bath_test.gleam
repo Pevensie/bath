@@ -3,8 +3,10 @@ import gleam/erlang/process
 import gleam/io
 import gleeunit
 import gleeunit/should
+import logging
 
 pub fn main() {
+  logging.configure()
   gleeunit.main()
 }
 
@@ -71,6 +73,9 @@ pub fn pool_handles_caller_crash_test() {
     |> bath.with_size(1)
     |> bath.start(1000)
 
+  // Expect an error message here
+  logging.set_level(logging.Critical)
+
   process.start(
     fn() {
       use _ <- bath.apply(pool, 1000)
@@ -79,7 +84,10 @@ pub fn pool_handles_caller_crash_test() {
     False,
   )
 
-  process.sleep(1000)
+  process.sleep(100)
+
+  // Reset level
+  logging.configure()
 
   // Ensure the pool still has an available resource
   let assert Ok(10) = bath.apply(pool, 1000, fn(r) { r })

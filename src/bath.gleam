@@ -1,11 +1,14 @@
 import gleam/deque
 import gleam/dict.{type Dict}
+import gleam/erlang/charlist.{type Charlist}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/function
 import gleam/io
 import gleam/list
 import gleam/otp/actor
 import gleam/result
+import gleam/string
+import logging
 
 // ---- Pool config ----- //
 
@@ -205,7 +208,6 @@ fn handle_pool_message(
   msg: Msg(resource_type, resource_create_error),
   state: State(resource_type, resource_create_error),
 ) {
-  io.debug(state.live_resources)
   case msg {
     CheckIn(resource:, caller:) -> {
       // If the checked-in process currently has a live resource, remove it from
@@ -215,18 +217,18 @@ fn handle_pool_message(
 
       let selector = case caller_live_resource {
         Ok(live_resource) -> {
-          process.demonitor_process(live_resource.monitor)
-
-          state.selector
-          |> process.deselecting_process_down(live_resource.monitor)
+          demonitor_process(state.selector, live_resource.monitor)
         }
         Error(_) -> state.selector
       }
 
       let new_resources = deque.push_back(state.resources, resource)
 
-      actor.continue(
-        State(..state, resources: new_resources, live_resources:, selector:),
+      actor.with_selector(
+        actor.continue(
+          State(..state, resources: new_resources, live_resources:, selector:),
+        ),
+        selector,
       )
     }
     CheckOut(reply_to:, caller:) -> {
@@ -249,7 +251,10 @@ fn handle_pool_message(
             True -> {
               use resource <- result.try(
                 state.create_resource()
-                |> result.map_error(CheckOutResourceCreateError),
+                |> result.map_error(fn(err) {
+                  log_resource_creation_error(err)
+                  CheckOutResourceCreateError(err)
+                }),
               )
               // Checked-in resources queue hasn't changed, but we've added a new resource
               // so current size has increased
@@ -268,10 +273,7 @@ fn handle_pool_message(
         }
         Ok(#(resource, new_resources, new_current_size)) -> {
           // Monitor the caller process
-          let monitor = process.monitor_process(caller)
-          let selector =
-            state.selector
-            |> process.selecting_process_down(monitor, CallerDown)
+          let #(monitor, selector) = monitor_process(state.selector, caller)
 
           let live_resources =
             dict.insert(
@@ -281,14 +283,17 @@ fn handle_pool_message(
             )
 
           actor.send(reply_to, Ok(resource))
-          actor.continue(
-            State(
-              ..state,
-              resources: new_resources,
-              current_size: new_current_size,
-              selector:,
-              live_resources:,
+          actor.with_selector(
+            actor.continue(
+              State(
+                ..state,
+                resources: new_resources,
+                current_size: new_current_size,
+                selector:,
+                live_resources:,
+              ),
             ),
+            selector,
           )
         }
       }
@@ -302,7 +307,6 @@ fn handle_pool_message(
       actor.Stop(exit_message.reason)
     }
     CallerDown(process_down) -> {
-      io.debug("Caller down")
       // If the caller was a live resource, either create a new one or
       // decrement the current size depending on the creation strategy
       case dict.get(state.live_resources, process_down.pid) {
@@ -310,10 +314,8 @@ fn handle_pool_message(
         Error(_) -> actor.continue(state)
         Ok(live_resource) -> {
           // Demonitor the process
-          process.demonitor_process(live_resource.monitor)
           let selector =
-            state.selector
-            |> process.deselecting_process_down(live_resource.monitor)
+            demonitor_process(state.selector, live_resource.monitor)
 
           let #(new_resources, new_current_size) = case
             state.creation_strategy
@@ -331,25 +333,27 @@ fn handle_pool_message(
                 )
                 // Size has changed
                 Error(resource_create_error) -> {
-                  io.debug("Bath: Resource creation failed")
-                  io.debug(resource_create_error)
+                  log_resource_creation_error(resource_create_error)
                   #(state.resources, state.current_size)
                 }
               }
             }
           }
 
-          actor.continue(
-            State(
-              ..state,
-              resources: new_resources,
-              current_size: new_current_size,
-              selector:,
-              live_resources: dict.delete(
-                state.live_resources,
-                process_down.pid,
+          actor.with_selector(
+            actor.continue(
+              State(
+                ..state,
+                resources: new_resources,
+                current_size: new_current_size,
+                selector:,
+                live_resources: dict.delete(
+                  state.live_resources,
+                  process_down.pid,
+                ),
               ),
             ),
+            selector,
           )
         }
       }
@@ -392,4 +396,34 @@ fn pool_spec(
 
     actor.Ready(state, selector)
   })
+}
+
+// ----- Utils ----- //
+
+fn monitor_process(
+  selector: process.Selector(Msg(resource_type, resource_create_error)),
+  pid: Pid,
+) {
+  let monitor = process.monitor_process(pid)
+  let selector =
+    selector
+    |> process.selecting_process_down(monitor, CallerDown)
+  #(monitor, selector)
+}
+
+fn demonitor_process(
+  selector: process.Selector(Msg(resource_type, resource_create_error)),
+  monitor: process.ProcessMonitor,
+) {
+  let selector =
+    selector
+    |> process.deselecting_process_down(monitor)
+  selector
+}
+
+fn log_resource_creation_error(resource_create_error: resource_create_error) {
+  logging.log(
+    logging.Error,
+    "Bath: Resource creation failed: " <> string.inspect(resource_create_error),
+  )
 }
