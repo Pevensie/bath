@@ -32,6 +32,7 @@ pub opaque type Builder(resource_type) {
     shutdown_resource: fn(resource_type) -> Nil,
     checkout_strategy: CheckoutStrategy,
     creation_strategy: CreationStrategy,
+    log_errors: Bool,
   )
 }
 
@@ -58,6 +59,7 @@ pub opaque type Builder(resource_type) {
 /// | `shutdown_resource` | `fn(_resource) { Nil }` |
 /// | `checkout_strategy` | `FIFO` |
 /// | `creation_strategy` | `Lazy` |
+/// | `log_errors` | `False` |
 pub fn new(
   resource create_resource: fn() -> Result(resource_type, String),
 ) -> Builder(resource_type) {
@@ -67,6 +69,7 @@ pub fn new(
     shutdown_resource: fn(_) { Nil },
     checkout_strategy: FIFO,
     creation_strategy: Lazy,
+    log_errors: False,
   )
 }
 
@@ -100,6 +103,14 @@ pub fn creation_strategy(
   strategy creation_strategy: CreationStrategy,
 ) -> Builder(resource_type) {
   Builder(..builder, creation_strategy:)
+}
+
+/// Set whether the pool logs errors when resources fail to create.
+pub fn log_errors(
+  builder builder: Builder(resource_type),
+  log_errors log_errors: Bool,
+) -> Builder(resource_type) {
+  Builder(..builder, log_errors:)
 }
 
 // ----- Lifecycle functions ---- //
@@ -255,6 +266,7 @@ pub opaque type State(resource_type) {
     current_size: Int,
     live_resources: LiveResources(resource_type),
     selector: process.Selector(Msg(resource_type)),
+    log_errors: Bool,
   )
 }
 
@@ -319,7 +331,7 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
               use resource <- result.try(
                 state.create_resource()
                 |> result.map_error(fn(err) {
-                  log_resource_creation_error(err)
+                  log_resource_creation_error(state.log_errors, err)
                   CheckOutResourceCreateError(err)
                 }),
               )
@@ -434,7 +446,10 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
                 )
                 // Size has changed
                 Error(resource_create_error) -> {
-                  log_resource_creation_error(resource_create_error)
+                  log_resource_creation_error(
+                    state.log_errors,
+                    resource_create_error,
+                  )
                   #(state.resources, state.current_size)
                 }
               }
@@ -512,6 +527,7 @@ fn actor_builder(
         max_size: builder.size,
         create_resource: builder.create_resource,
         shutdown_resource: builder.shutdown_resource,
+        log_errors: builder.log_errors,
       )
 
     actor.initialised(state)
@@ -542,11 +558,18 @@ fn demonitor_process(
   selector
 }
 
-fn log_resource_creation_error(resource_create_error: String) {
-  logging.log(
-    logging.Error,
-    "Bath: Resource creation failed: " <> resource_create_error,
-  )
+fn log_resource_creation_error(
+  log_errors: Bool,
+  resource_create_error: String,
+) -> Nil {
+  case log_errors {
+    True ->
+      logging.log(
+        logging.Error,
+        "Bath: Resource creation failed: " <> resource_create_error,
+      )
+    False -> Nil
+  }
 }
 
 /// Iterate over a list, applying a function that returns a result.
