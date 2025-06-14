@@ -9,22 +9,37 @@ any value, such as database connections, file handles, or other resources.
 ## Installation
 
 ```sh
-gleam add bath@2
+gleam add bath@3
 ```
 
 ## Usage
 
+The recommended way to start a Bath pool is with the `supervised` function. You
+can use this to include the Bath pool in your application's supervision tree.
+
 ```gleam
 import bath
 import fake_db
+import gleam/otp/static_supervisor as supervisor
 
 pub fn main() {
-  // Create a pool of 10 connections to some fictional database.
-  let assert Ok(pool) =
-    bath.new(fn() { fake_db.connect() })
-    |> bath.with_size(10)
-    |> bath.with_shutdown(fn(conn) { fake_db.close(conn) })
-    |> bath.start(1000)
+  let pool_receiver = process.new_subject()
+
+  // Define a pool of 10 connections to some fictional database, and create a child
+  // spec to allow it to be supervised.
+  let bath_child_spec =
+    bath.new(fn() { fake_db.get_conn() })
+    |> bath.size(10)
+    |> bath.supervised(pool_receiver, 1000)
+
+  // Start the pool under a supervisor
+  let assert Ok(_started) =
+    supervisor.new(supervisor.OneForOne)
+    |> supervisor.add(bath_child_spec)
+    |> supervisor.start
+
+  // Receive the pool handle now that it's started
+  let assert Ok(pool) = process.receive(pool_receiver, 1000)
 
   // Use the pool. Shown here in a block to use `use`.
   let assert Ok("Hello!") = {
@@ -34,7 +49,7 @@ pub fn main() {
   }
 
   // Close the pool.
-  let assert Ok(_) = bath.shutdown(pool, fn(conn) { fake_db.close(conn) }, 1000)
+  let assert Ok(_) = bath.shutdown(pool, False, 1000)
 }
 ```
 
@@ -42,7 +57,12 @@ Further documentation can be found at <https://hexdocs.pm/bath>.
 
 ## Development
 
+If you've found any bugs, please open an issue on
+[GitHub](https://github.com/Pevensie/bath/issues).
+
+The code is reasonably well tested and documented, but PRs to improve either are always
+welcome.
+
 ```sh
-gleam run   # Run the project
 gleam test  # Run the tests
 ```

@@ -1,14 +1,14 @@
 name = "bath"
-version = "2.0.0"
+version = "3.0.0"
 description = "A resource pool for Gleam!"
 licences = ["MIT"]
 repository = { type = "github", user = "Pevensie", repo = "bath" }
 # links = [{ title = "Website", href = "" }]
 
 [dependencies]
-gleam_stdlib = ">= 0.51.0 and < 2.0.0"
-gleam_otp = ">= 0.16.0 and < 1.0.0"
-gleam_erlang = ">= 0.33.0 and < 1.0.0"
+gleam_stdlib = ">= 0.60.0 and < 2.0.0"
+gleam_otp = ">= 1.0.0 and < 2.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_deque = ">= 1.0.0 and < 2.0.0"
 logging = ">= 1.3.0 and < 2.0.0"
 
