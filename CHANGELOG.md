@@ -1,5 +1,70 @@
 # Changelog
 
+## v3.0.0 - 2025-06-14
+
+Bath has been updated to use the new stable versions of `gleam/erlang` and
+`gleam/otp`. Bath now follows the conventions laid out in `gleam/otp`, and
+creating a resource pool under a supervisor is now much easier.
+
+### Example
+
+The recommended way to start a Bath pool is with the `supervised` function. You
+can use this to include the Bath pool in your application's supervision tree.
+
+```gleam
+import bath
+import fake_db
+import gleam/otp/static_supervisor as supervisor
+
+pub fn main() {
+  let pool_receiver = process.new_subject()
+
+  // Define a pool of 10 connections to some fictional database, and create a child
+  // spec to allow it to be supervised.
+  let bath_child_spec =
+    bath.new(fn() { fake_db.get_conn() })
+    |> bath.size(10)
+    |> bath.supervised(pool_receiver, 1000)
+
+  // Start the pool under a supervisor
+  let assert Ok(_started) =
+    supervisor.new(supervisor.OneForOne)
+    |> supervisor.add(bath_child_spec)
+    |> supervisor.start
+
+  // Receive the pool handle now that it's started
+  let assert Ok(pool) = process.receive(pool_receiver, 1000)
+
+  // Use the pool. Shown here in a block to use `use`.
+  let assert Ok("Hello!") = {
+    use conn <- bath.apply(pool, 1000)
+    // Do stuff with the connection...
+    "Hello!"
+  }
+
+  // Close the pool.
+  let assert Ok(_) = bath.shutdown(pool, False, 1000)
+}
+```
+
+### Behavioural changes
+
+#### Panics
+
+Like the new version of `gleam/erlang`, failing to send messages to the Bath pool will
+will now panic rather than returning an error result.
+
+##### Why?
+
+Previously, Bath used the `process.try_call` function that was present in
+`gleam/erlang`. However, this had the potential to cause a memory leak if the
+process did not return within the provided timeout.
+
+The calling process would cancel its receive operation and continue, and the
+process would also continue its operation. When the process replied to the
+calling process, that message would be stuck in the caller's queue, never to
+be received.
+
 ## v2.0.0 - 2024-12-29
 
 - Switch to a builder pattern for pool configuration.

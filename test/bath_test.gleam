@@ -1,6 +1,9 @@
 import bath
 import gleam/erlang/process
+import gleam/function
+import gleam/int
 import gleam/io
+import gleam/otp/actor
 import gleeunit
 import gleeunit/should
 import logging
@@ -14,10 +17,9 @@ pub fn main() {
 pub fn lifecycle_test() {
   let assert Ok(pool) =
     bath.new(fn() { Ok(10) })
-    |> bath.with_size(1)
-    |> bath.with_shutdown(fn(res) {
-      io.debug("Shutting down")
-      io.debug(res)
+    |> bath.size(1)
+    |> bath.on_shutdown(fn(res) {
+      io.println("Shutting down with resource: " <> int.to_string(res))
       Nil
     })
     |> bath.start(1000)
@@ -28,7 +30,7 @@ pub fn lifecycle_test() {
 pub fn empty_pool_fails_to_apply_test() {
   let assert Ok(pool) =
     bath.new(fn() { Ok(10) })
-    |> bath.with_size(0)
+    |> bath.size(0)
     |> bath.start(1000)
   let assert Error(bath.NoResourcesAvailable) =
     bath.apply(pool, 1000, fn(_) { Nil })
@@ -38,7 +40,7 @@ pub fn empty_pool_fails_to_apply_test() {
 pub fn pool_has_correct_capacity_test() {
   let assert Ok(pool) =
     bath.new(fn() { Ok(10) })
-    |> bath.with_size(1)
+    |> bath.size(1)
     |> bath.start(1000)
   let assert Ok(_) =
     bath.apply(pool, 1000, fn(_) {
@@ -54,7 +56,7 @@ pub fn pool_has_correct_capacity_test() {
 pub fn pool_has_correct_resources_test() {
   let assert Ok(pool) =
     bath.new(fn() { Ok(10) })
-    |> bath.with_size(10)
+    |> bath.size(10)
     |> bath.start(1000)
 
   let assert Ok(_) =
@@ -70,19 +72,16 @@ pub fn pool_has_correct_resources_test() {
 pub fn pool_handles_caller_crash_test() {
   let assert Ok(pool) =
     bath.new(fn() { Ok(10) })
-    |> bath.with_size(1)
+    |> bath.size(1)
     |> bath.start(1000)
 
   // Expect an error message here
   logging.set_level(logging.Critical)
 
-  process.start(
-    fn() {
-      use _ <- bath.apply(pool, 1000)
-      panic as "Oh no, the caller crashed!"
-    },
-    False,
-  )
+  process.spawn_unlinked(fn() {
+    use _ <- bath.apply(pool, 1000)
+    panic as "Oh no, the caller crashed!"
+  })
 
   process.sleep(100)
 
@@ -93,4 +92,41 @@ pub fn pool_handles_caller_crash_test() {
   let assert Ok(10) = bath.apply(pool, 1000, fn(r) { r })
 
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+}
+
+pub fn eager_pool_fails_to_start_if_resource_creation_fails_test() {
+  let assert Error(actor.InitFailed("Failed to create resource")) =
+    bath.new(fn() { Error("Failed to create resource") })
+    |> bath.creation_strategy(bath.Eager)
+    |> bath.start(1000)
+}
+
+pub fn shutdown_function_gets_called_test() {
+  let self = process.new_subject()
+
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.creation_strategy(bath.Eager)
+    |> bath.on_shutdown(fn(_) { process.send(self, "Shut down") })
+    |> bath.start(1000)
+
+  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+
+  let assert Ok("Shut down") = process.receive(self, 1000)
+}
+
+// ----- Util tests  ----- //
+
+pub fn try_map_returning_succeeds_if_no_errors_test() {
+  let list = [Ok(1), Ok(2), Ok(3)]
+
+  let assert Ok([1, 2, 3]) = bath.try_map_returning(list, function.identity)
+}
+
+pub fn try_map_returning_fails_early_if_any_errors_test() {
+  let list = [Ok(1), Error("error"), Ok(3)]
+
+  let assert Error(#([1], "error")) =
+    bath.try_map_returning(list, function.identity)
 }
