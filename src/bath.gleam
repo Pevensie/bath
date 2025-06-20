@@ -1,6 +1,7 @@
 import gleam/deque
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/int
 import gleam/list
 import gleam/otp/actor
 import gleam/otp/supervision
@@ -73,12 +74,12 @@ pub fn new(
   )
 }
 
-/// Set the pool size. Defaults to 10.
+/// Set the pool size. Defaults to 10. Will be clamped to a minimum of 1.
 pub fn size(
   builder builder: Builder(resource_type),
   size size: Int,
 ) -> Builder(resource_type) {
-  Builder(..builder, size:)
+  Builder(..builder, size: int.max(size, 1))
 }
 
 /// Set a shutdown function to be run for each resource when the pool exits.
@@ -189,6 +190,36 @@ pub fn start(
   Ok(Pool(started.data))
 }
 
+/// The type used to indicate what to do with a resource after use.
+pub opaque type Next(return) {
+  /// Return the resource to the pool.
+  Keep(return)
+  /// Discard the resource, running the shutdown function on it.
+  Discard(return)
+}
+
+/// Instruct Bath to keep the checked out resource, returning it to the pool.
+pub fn keep() -> Next(Nil) {
+  Keep(Nil)
+}
+
+/// Instruct Bath to discard the checked out resource, running the shutdown function on
+/// it.
+///
+/// Discarded resources will be recreated lazily, regardless of the pool's creation
+/// strategy.
+pub fn discard() -> Next(Nil) {
+  Discard(Nil)
+}
+
+/// Return a value from a use of [`apply`](#apply).
+pub fn returning(next: Next(old), value: new) -> Next(new) {
+  case next {
+    Keep(_) -> Keep(value)
+    Discard(_) -> Discard(value)
+  }
+}
+
 /// Checks out a resource from the pool, sending the caller Pid for the pool to
 /// monitor in case the client dies. This allows the pool to create a new resource
 /// later if required.
@@ -200,8 +231,13 @@ fn check_out(
   process.call(pool.subject, timeout, CheckOut(_, caller:))
 }
 
-fn check_in(pool: Pool(resource_type), resource: resource_type, caller: Pid) {
-  process.send(pool.subject, CheckIn(resource:, caller:))
+fn check_in(
+  pool: Pool(resource_type),
+  resource: resource_type,
+  caller: Pid,
+  next: Next(Nil),
+) {
+  process.send(pool.subject, CheckIn(resource:, caller:, next:))
 }
 
 /// Check out a resource from the pool, apply the `next` function, then check
@@ -213,26 +249,36 @@ fn check_in(pool: Pool(resource_type), resource: resource_type, caller: Pid) {
 ///   |> bath.start(1000)
 ///
 /// use resource <- bath.apply(pool, 1000)
+///
 /// // Do stuff with resource...
+///
+/// // Return the resource to the pool, returning "Hello!" to the caller.
+/// bath.keep()
+/// |> bath.returning("Hello!")
 /// ```
 pub fn apply(
   pool pool: Pool(resource_type),
   timeout timeout: Int,
-  next next: fn(resource_type) -> result_type,
+  next next: fn(resource_type) -> Next(result_type),
 ) -> Result(result_type, ApplyError) {
   let self = process.self()
   use resource <- result.try(check_out(pool, self, timeout))
 
-  let usage_result = next(resource)
+  let next_action = next(resource)
 
-  check_in(pool, resource, self)
+  let #(usage_result, next_action) = case next_action {
+    Keep(return) -> #(return, Keep(Nil))
+    Discard(return) -> #(return, Discard(Nil))
+  }
+
+  check_in(pool, resource, self, next_action)
 
   Ok(usage_result)
 }
 
-/// Shut down the pool, calling the `shutdown_function` on each
+/// Shut down the pool, calling the shutdown function on each
 /// resource in the pool. Calling with `force` set to `True` will
-/// force the shutdown, not calling the `shutdown_function` on any
+/// force the shutdown, not calling the shutdown function on any
 /// resources.
 ///
 /// Will fail if there are still resources checked out, unless `force` is
@@ -279,7 +325,7 @@ type LiveResource(resource_type) {
 
 /// A message sent to the pool actor.
 pub opaque type Msg(resource_type) {
-  CheckIn(resource: resource_type, caller: Pid)
+  CheckIn(resource: resource_type, caller: Pid, next: Next(Nil))
   CheckOut(reply_to: Subject(Result(resource_type, ApplyError)), caller: Pid)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
@@ -288,7 +334,7 @@ pub opaque type Msg(resource_type) {
 
 fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
   case msg {
-    CheckIn(resource:, caller:) -> {
+    CheckIn(resource:, caller:, next:) -> {
       // If the checked-in process currently has a live resource, remove it from
       // the live_resources dict
       let caller_live_resource = dict.get(state.live_resources, caller)
@@ -301,14 +347,26 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
         Error(_) -> state.selector
       }
 
-      let new_resources = deque.push_back(state.resources, resource)
+      let #(new_resources, current_size) = case next {
+        Keep(_) -> #(
+          deque.push_back(state.resources, resource),
+          state.current_size,
+        )
+        Discard(_) -> {
+          state.shutdown_resource(resource)
+          #(state.resources, state.current_size - 1)
+        }
+      }
 
-      actor.with_selector(
-        actor.continue(
-          State(..state, resources: new_resources, live_resources:, selector:),
-        ),
-        selector,
+      State(
+        ..state,
+        current_size:,
+        resources: new_resources,
+        live_resources:,
+        selector:,
       )
+      |> actor.continue
+      |> actor.with_selector(selector)
     }
     CheckOut(reply_to:, caller:) -> {
       // We always push to the back, so for FIFO, we pop front,
@@ -362,18 +420,15 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
             )
 
           actor.send(reply_to, Ok(resource))
-          actor.with_selector(
-            actor.continue(
-              State(
-                ..state,
-                resources: new_resources,
-                current_size: new_current_size,
-                selector:,
-                live_resources:,
-              ),
-            ),
-            selector,
+          State(
+            ..state,
+            resources: new_resources,
+            current_size: new_current_size,
+            selector:,
+            live_resources:,
           )
+          |> actor.continue
+          |> actor.with_selector(selector)
         }
       }
     }
