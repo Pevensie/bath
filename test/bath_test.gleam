@@ -23,18 +23,29 @@ pub fn lifecycle_test() {
       Nil
     })
     |> bath.start(1000)
-  let assert Ok(20) = bath.apply(pool, 1000, fn(n) { n * 2 })
+  let assert Ok(20) =
+    bath.apply(pool, 1000, fn(n) { bath.keep() |> bath.returning(n * 2) })
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
 }
 
 pub fn empty_pool_fails_to_apply_test() {
   let assert Ok(pool) =
     bath.new(fn() { Ok(10) })
-    |> bath.size(0)
+    |> bath.size(1)
     |> bath.start(1000)
+
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 1000)
+    process.sleep(1000)
+    bath.keep()
+  })
+
+  process.sleep(100)
+
   let assert Error(bath.NoResourcesAvailable) =
-    bath.apply(pool, 1000, fn(_) { Nil })
-  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+    bath.apply(pool, 1000, fn(_) { bath.keep() })
+
+  let assert Ok(Nil) = bath.shutdown(pool, True, 1000)
 }
 
 pub fn pool_has_correct_capacity_test() {
@@ -47,8 +58,8 @@ pub fn pool_has_correct_capacity_test() {
       // Only one capacity, so attempting to check out another resource
       // should fail
       let assert Error(bath.NoResourcesAvailable) =
-        bath.apply(pool, 1000, fn(_) { Nil })
-      Nil
+        bath.apply(pool, 1000, fn(_) { bath.keep() })
+      bath.keep()
     })
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
 }
@@ -64,6 +75,8 @@ pub fn pool_has_correct_resources_test() {
       // Check we have the right values
       n
       |> should.equal(10)
+
+      bath.keep()
     })
 
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
@@ -89,7 +102,8 @@ pub fn pool_handles_caller_crash_test() {
   logging.configure()
 
   // Ensure the pool still has an available resource
-  let assert Ok(10) = bath.apply(pool, 1000, fn(r) { r })
+  let assert Ok(10) =
+    bath.apply(pool, 1000, fn(r) { bath.keep() |> bath.returning(r) })
 
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
 }
@@ -114,6 +128,40 @@ pub fn shutdown_function_gets_called_test() {
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
 
   let assert Ok("Shut down") = process.receive(self, 1000)
+}
+
+pub fn shutdown_function_gets_called_on_discard_test() {
+  let self = process.new_subject()
+
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.creation_strategy(bath.Eager)
+    |> bath.on_shutdown(fn(_) { process.send(self, "Shut down") })
+    |> bath.start(1000)
+
+  let assert Ok(_) = bath.apply(pool, 1000, fn(_) { bath.discard() })
+
+  let assert Ok("Shut down") = process.receive(self, 1000)
+
+  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+}
+
+pub fn shutdown_function_doesnt_get_called_on_keep_test() {
+  let self = process.new_subject()
+
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.creation_strategy(bath.Eager)
+    |> bath.on_shutdown(fn(_) { process.send(self, "Shut down") })
+    |> bath.start(1000)
+
+  let assert Ok(_) = bath.apply(pool, 1000, fn(_) { bath.keep() })
+
+  let assert Error(Nil) = process.receive(self, 100)
+
+  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
 }
 
 // ----- Util tests  ----- //

@@ -1,5 +1,13 @@
 # Changelog
 
+## v4.0.0 - 2025-06-20
+
+- The function passed to `bath.apply` must now return a `bath.Next(return)` value to
+  indicate whether the checked-out resource should be returned to the pool or
+  discarded. This allows users to control the lifecycle of resources more precisely.
+  For example, you can now shut down and dispose of pooled TCP sockets for which the
+  connection has been closed.
+
 ## v3.0.0 - 2025-06-14
 
 Bath has been updated to use the new stable versions of `gleam/erlang` and

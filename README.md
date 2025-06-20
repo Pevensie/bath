@@ -44,8 +44,12 @@ pub fn main() {
   // Use the pool. Shown here in a block to use `use`.
   let assert Ok("Hello!") = {
     use conn <- bath.apply(pool, 1000)
+
     // Do stuff with the connection...
-    "Hello!"
+
+    // Return the connection to the pool, returning "Hello!" to the caller.
+    bath.keep()
+    |> bath.returning("Hello!")
   }
 
   // Close the pool.
