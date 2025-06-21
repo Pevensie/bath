@@ -1,6 +1,7 @@
 import gleam/deque
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/function
 import gleam/int
 import gleam/list
 import gleam/otp/actor
@@ -164,13 +165,25 @@ pub fn supervised(
   receiver pool_receiver: Subject(Pool(resource_type)),
   timeout init_timeout: Int,
 ) {
+  supervised_map(builder, pool_receiver, function.identity, init_timeout)
+}
+
+/// Like [`supervised`](#supervised), but allows you to pass a mapping function to
+/// transform the pool handler before sending it to the receiver. This is mostly
+/// useful for library authors who wish to use Bath to create a pool of resources.
+pub fn supervised_map(
+  builder builder: Builder(resource_type),
+  receiver pool_receiver: Subject(a),
+  using mapper: fn(Pool(resource_type)) -> a,
+  timeout init_timeout: Int,
+) {
   supervision.worker(fn() {
     use started <- result.try(
       actor_builder(builder, init_timeout)
       |> actor.start,
     )
 
-    process.send(pool_receiver, Pool(started.data))
+    process.send(pool_receiver, mapper(Pool(started.data)))
     Ok(started)
   })
 }
@@ -607,6 +620,7 @@ fn demonitor_process(
   selector: process.Selector(Msg(resource_type)),
   monitor: process.Monitor,
 ) {
+  process.demonitor_process(monitor)
   let selector =
     selector
     |> process.deselect_specific_monitor(monitor)

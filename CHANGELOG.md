@@ -1,5 +1,12 @@
 # Changelog
 
+## v4.1.0 - 2025-06-21
+
+- Added `bath.supervised_map` to create a supervised pool of resources while mapping
+  the `Pool` value to a new type.
+- Fixed an issue where Bath would fail to demonitor processes once a resource had been
+  checked back into the pool.
+
 ## v4.0.0 - 2025-06-20
 
 - The function passed to `bath.apply` must now return a `bath.Next(return)` value to

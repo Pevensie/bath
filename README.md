@@ -9,7 +9,7 @@ any value, such as database connections, file handles, or other resources.
 ## Installation
 
 ```sh
-gleam add bath@3
+gleam add bath
 ```
 
 ## Usage
