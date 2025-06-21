@@ -4,6 +4,7 @@ import gleam/function
 import gleam/int
 import gleam/io
 import gleam/otp/actor
+import gleam/otp/static_supervisor
 import gleeunit
 import gleeunit/should
 import logging
@@ -26,6 +27,46 @@ pub fn lifecycle_test() {
   let assert Ok(20) =
     bath.apply(pool, 1000, fn(n) { bath.keep() |> bath.returning(n * 2) })
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+}
+
+pub fn supervised_lifecycle_test() {
+  let pool_receiver = process.new_subject()
+
+  let bath_child_spec =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.supervised(pool_receiver, 1000)
+
+  let assert Ok(_started) =
+    static_supervisor.new(static_supervisor.OneForOne)
+    |> static_supervisor.add(bath_child_spec)
+    |> static_supervisor.start
+
+  let assert Ok(pool) = process.receive(pool_receiver, 1000)
+
+  let assert Ok(_) = bath.shutdown(pool, False, 1000)
+}
+
+type Mapped(a) {
+  Mapped(a)
+}
+
+pub fn supervised_map_test() {
+  let number_receiver = process.new_subject()
+
+  let bath_child_spec =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.supervised_map(number_receiver, Mapped, 1000)
+
+  let assert Ok(_started) =
+    static_supervisor.new(static_supervisor.OneForOne)
+    |> static_supervisor.add(bath_child_spec)
+    |> static_supervisor.start
+
+  let assert Ok(Mapped(pool)) = process.receive(number_receiver, 1000)
+
+  let assert Ok(_) = bath.shutdown(pool, False, 1000)
 }
 
 pub fn empty_pool_fails_to_apply_test() {
