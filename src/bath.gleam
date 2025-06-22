@@ -1,6 +1,7 @@
 import gleam/deque
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/function
 import gleam/int
 import gleam/list
 import gleam/option
@@ -180,8 +181,19 @@ pub fn supervised(
   builder builder: Builder(resource_type),
   timeout init_timeout: Int,
 ) {
+  supervised_map(builder, function.identity, init_timeout)
+}
+
+/// Like [`supervised`](#supervised), but allows you to pass a mapping function to
+/// transform the pool return value to the receiver. This is mostly useful for library
+/// authors who wish to use Bath to create a pool of resources.
+pub fn supervised_map(
+  builder builder: Builder(resource_type),
+  using mapper: fn(process.Subject(Msg(resource_type))) -> a,
+  timeout init_timeout: Int,
+) {
   supervision.worker(fn() {
-    actor_builder(builder, init_timeout)
+    actor_builder(builder, mapper, init_timeout)
     |> actor.start
   })
 }
@@ -194,7 +206,7 @@ pub fn start(
   timeout init_timeout: Int,
 ) -> Result(process.Subject(Msg(resource_type)), actor.StartError) {
   use started <- result.try(
-    actor_builder(builder, init_timeout)
+    actor_builder(builder, function.identity, init_timeout)
     |> actor.start,
   )
 
@@ -563,12 +575,9 @@ fn create_pool_resources(
 
 fn actor_builder(
   builder: Builder(resource_type),
+  mapper: fn(Subject(Msg(resource_type))) -> return,
   init_timeout: Int,
-) -> actor.Builder(
-  State(resource_type),
-  Msg(resource_type),
-  Subject(Msg(resource_type)),
-) {
+) -> actor.Builder(State(resource_type), Msg(resource_type), return) {
   let pool_builder =
     actor.new_with_initialiser(init_timeout, fn(self) {
       use #(resources, current_size) <- result.try(create_pool_resources(
@@ -599,7 +608,7 @@ fn actor_builder(
 
       actor.initialised(state)
       |> actor.selecting(selector)
-      |> actor.returning(self)
+      |> actor.returning(mapper(self))
       |> Ok
     })
     |> actor.on_message(handle_pool_message)

@@ -6,8 +6,7 @@
   wrapper, anyway.
 - Allow pools to be named, avoiding the previous dance required to start a supervised
   pool.
-  - This changes the signature of `bath.supervised` and removes the need for
-    `bath.supervised_map`.
+  - This changes the signature of `bath.supervised` and `bath.supervised_map`.
 
 ## v4.1.0 - 2025-06-21
 
