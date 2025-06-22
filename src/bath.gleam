@@ -144,7 +144,13 @@ pub type ShutdownError {
 /// import gleam/otp/static_supervisor as supervisor
 ///
 /// fn main() {
-///   let pool_receiver = process.new_subject()
+///   // Create a subject to receive the pool handler once the supervision tree has been
+///   // started. Use a named subject to make sure we can always receive the pool handler,
+///   // even if our original process crashes.
+///   let pool_receiver_name = process.new_name("bath_pool_receiver")
+///   let assert Ok(_) = process.register(process.self(), pool_receiver_name)
+///
+///   let pool_receiver = process.named_subject(pool_receiver_name)
 ///
 ///   let assert Ok(_started) =
 ///     supervisor.new(supervisor.OneForOne)
@@ -157,7 +163,7 @@ pub type ShutdownError {
 ///   let assert Ok(pool) =
 ///     process.receive(pool_receiver)
 ///
-///   let assert Ok(_) = bath.apply(pool, fn(res) { echo res })
+///   // Do more stuff...
 /// }
 /// ```
 pub fn supervised(
@@ -296,6 +302,9 @@ pub fn apply(
 ///
 /// Will fail if there are still resources checked out, unless `force` is
 /// `True`.
+///
+/// You only need to call this when using unsupervised pools. You should let your
+/// supervision tree handle the shutdown of supervised resource pools.
 pub fn shutdown(
   pool pool: Pool(resource_type),
   force force: Bool,
