@@ -23,20 +23,17 @@ import fake_db
 import gleam/otp/static_supervisor as supervisor
 
 pub fn main() {
-  // Create a subject to receive the pool handler once the supervision tree has been
-  // started. Use a named subject to make sure we can always receive the pool handler,
-  // even if our original process crashes.
-  let pool_receiver_name = process.new_name("bath_pool_receiver")
-  let assert Ok(_) = process.register(process.self(), pool_receiver_name)
-
-  let pool_receiver = process.named_subject(pool_receiver_name)
+  // Create a name to interact with the pool once it's started under the
+  // static supervisor.
+  let pool_name = process.new_name("bath_pool")
 
   // Define a pool of 10 connections to some fictional database, and create a child
   // spec to allow it to be supervised.
   let bath_child_spec =
     bath.new(fn() { fake_db.get_conn() })
     |> bath.size(10)
-    |> bath.supervised(pool_receiver, 1000)
+    |> bath.name(pool_name)
+    |> bath.supervised(1000)
 
   // Start the pool under a supervisor
   let assert Ok(_started) =
@@ -45,7 +42,7 @@ pub fn main() {
     |> supervisor.start
 
   // Receive the pool handle now that it's started
-  let assert Ok(pool) = process.receive(pool_receiver, 1000)
+  let pool = process.named_subject(pool_name)
 
   // Use the pool. Shown here in a block to use `use`.
   let assert Ok("Hello!") = {

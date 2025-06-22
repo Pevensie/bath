@@ -30,41 +30,20 @@ pub fn lifecycle_test() {
 }
 
 pub fn supervised_lifecycle_test() {
-  let pool_receiver = process.new_subject()
+  let pool_name = process.new_name("bath_pool")
 
   let bath_child_spec =
     bath.new(fn() { Ok(10) })
     |> bath.size(1)
-    |> bath.supervised(pool_receiver, 1000)
+    |> bath.name(pool_name)
+    |> bath.supervised(1000)
 
   let assert Ok(_started) =
     static_supervisor.new(static_supervisor.OneForOne)
     |> static_supervisor.add(bath_child_spec)
     |> static_supervisor.start
 
-  let assert Ok(pool) = process.receive(pool_receiver, 1000)
-
-  let assert Ok(_) = bath.shutdown(pool, False, 1000)
-}
-
-type Mapped(a) {
-  Mapped(a)
-}
-
-pub fn supervised_map_test() {
-  let number_receiver = process.new_subject()
-
-  let bath_child_spec =
-    bath.new(fn() { Ok(10) })
-    |> bath.size(1)
-    |> bath.supervised_map(number_receiver, Mapped, 1000)
-
-  let assert Ok(_started) =
-    static_supervisor.new(static_supervisor.OneForOne)
-    |> static_supervisor.add(bath_child_spec)
-    |> static_supervisor.start
-
-  let assert Ok(Mapped(pool)) = process.receive(number_receiver, 1000)
+  let pool = process.named_subject(pool_name)
 
   let assert Ok(_) = bath.shutdown(pool, False, 1000)
 }

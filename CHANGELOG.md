@@ -1,5 +1,14 @@
 # Changelog
 
+## v5.0.0 - 2025-06-22
+
+- Remove the `Pool` type in favour of `process.Subject(bath.Msg(msg))`. It was just a
+  wrapper, anyway.
+- Allow pools to be named, avoiding the previous dance required to start a supervised
+  pool.
+  - This changes the signature of `bath.supervised` and removes the need for
+    `bath.supervised_map`.
+
 ## v4.1.0 - 2025-06-21
 
 - Added `bath.supervised_map` to create a supervised pool of resources while mapping
