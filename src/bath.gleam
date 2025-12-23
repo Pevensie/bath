@@ -50,7 +50,7 @@ pub opaque type Builder(resource_type) {
 ///   // Create a pool of 10 connections to some fictional database.
 ///   let assert Ok(pool) =
 ///     bath.new(fn() { fake_db.connect() })
-///     |> bath.with_size(10)
+///     |> bath.size(10)
 ///     |> bath.start(1000)
 /// }
 /// ```
