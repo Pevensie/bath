@@ -136,6 +136,8 @@ pub fn log_errors(
 pub type ApplyError {
   NoResourcesAvailable
   CheckOutResourceCreateError(error: String)
+  CheckoutTimedOut
+  PoolShuttingDown
 }
 
 /// An error returned when the resource pool fails to shut down.
@@ -299,6 +301,73 @@ pub fn apply(
   Ok(usage_result)
 }
 
+/// Like [`apply`](#apply), but blocks waiting for a resource if the pool is
+/// exhausted instead of returning `NoResourcesAvailable` immediately.
+///
+/// The timeout covers both waiting in the queue and the call to the pool actor.
+/// If the timeout expires while waiting, `Error(CheckoutTimedOut)` is returned.
+/// If the pool shuts down while waiting, `Error(PoolShuttingDown)` is returned.
+///
+/// ```gleam
+/// let assert Ok(pool) =
+///   bath.new(fn() { Ok("Some pooled resource") })
+///   |> bath.size(1)
+///   |> bath.start(1000)
+///
+/// // This will block until a resource is available or timeout
+/// use resource <- bath.apply_blocking(pool, 5000)
+///
+/// // Do stuff with resource...
+///
+/// bath.keep()
+/// |> bath.returning("Hello!")
+/// ```
+pub fn apply_blocking(
+  pool pool: process.Subject(Msg(resource_type)),
+  timeout timeout: Int,
+  next next: fn(resource_type) -> Next(result_type),
+) -> Result(result_type, ApplyError) {
+  let self = process.self()
+  let checkout_result = blocking_checkout(pool, self, timeout)
+
+  case checkout_result {
+    Error(err) -> Error(err)
+    Ok(resource) -> {
+      let next_action = next(resource)
+
+      let #(usage_result, next_action) = case next_action {
+        Keep(return) -> #(return, Keep(Nil))
+        Discard(return) -> #(return, Discard(Nil))
+      }
+
+      check_in(pool, resource, self, next_action)
+
+      Ok(usage_result)
+    }
+  }
+}
+
+/// Internal function to perform blocking checkout with graceful timeout handling.
+/// Unlike process.call, this returns an error on timeout instead of panicking.
+fn blocking_checkout(
+  pool: process.Subject(Msg(resource_type)),
+  caller: Pid,
+  timeout: Int,
+) -> Result(resource_type, ApplyError) {
+  let reply_subject = process.new_subject()
+  process.send(pool, CheckOutBlocking(reply_to: reply_subject, caller:))
+
+  let selector =
+    process.new_selector()
+    |> process.select(reply_subject)
+
+  case process.selector_receive(selector, timeout) {
+    Error(Nil) -> Error(CheckoutTimedOut)
+    Ok(Error(err)) -> Error(err)
+    Ok(Ok(resource)) -> Ok(resource)
+  }
+}
+
 /// Shut down the pool, calling the shutdown function on each
 /// resource in the pool. Calling with `force` set to `True` will
 /// force the shutdown, not calling the shutdown function on any
@@ -332,6 +401,7 @@ pub opaque type State(resource_type) {
     resources: deque.Deque(resource_type),
     current_size: Int,
     live_resources: LiveResources(resource_type),
+    waiting: deque.Deque(WaitingRequest(resource_type)),
     selector: process.Selector(Msg(resource_type)),
     log_errors: Bool,
   )
@@ -344,12 +414,25 @@ type LiveResource(resource_type) {
   LiveResource(resource: resource_type, monitor: process.Monitor)
 }
 
+type WaitingRequest(resource_type) {
+  WaitingRequest(
+    reply_to: Subject(Result(resource_type, ApplyError)),
+    caller: Pid,
+    monitor: process.Monitor,
+  )
+}
+
 /// A message sent to the pool actor.
 pub opaque type Msg(resource_type) {
   CheckIn(resource: resource_type, caller: Pid, next: Next(Nil))
   CheckOut(reply_to: Subject(Result(resource_type, ApplyError)), caller: Pid)
+  CheckOutBlocking(
+    reply_to: Subject(Result(resource_type, ApplyError)),
+    caller: Pid,
+  )
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
+  WaiterDown(process.Down)
   Shutdown(reply_to: process.Subject(Result(Nil, ShutdownError)), force: Bool)
 }
 
@@ -368,26 +451,90 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
         Error(_) -> state.selector
       }
 
-      let #(new_resources, current_size) = case next {
-        Keep(_) -> #(
-          deque.push_back(state.resources, resource),
-          state.current_size,
-        )
+      case next {
+        Keep(_) -> {
+          case deque.pop_front(state.waiting) {
+            Ok(#(waiter, new_waiting)) -> {
+              let selector = demonitor_process(selector, waiter.monitor)
+              let #(monitor, selector) =
+                monitor_process(selector, waiter.caller)
+              let live_resources =
+                dict.insert(
+                  live_resources,
+                  waiter.caller,
+                  LiveResource(resource:, monitor:),
+                )
+              actor.send(waiter.reply_to, Ok(resource))
+              State(..state, live_resources:, waiting: new_waiting, selector:)
+              |> actor.continue
+              |> actor.with_selector(selector)
+            }
+            Error(_) -> {
+              State(
+                ..state,
+                resources: deque.push_back(state.resources, resource),
+                live_resources:,
+                selector:,
+              )
+              |> actor.continue
+              |> actor.with_selector(selector)
+            }
+          }
+        }
         Discard(_) -> {
           state.shutdown_resource(resource)
-          #(state.resources, state.current_size - 1)
+          let current_size = state.current_size - 1
+          case deque.pop_front(state.waiting) {
+            Ok(#(waiter, new_waiting)) -> {
+              case state.create_resource() {
+                Ok(new_resource) -> {
+                  let selector = demonitor_process(selector, waiter.monitor)
+                  let #(monitor, selector) =
+                    monitor_process(selector, waiter.caller)
+                  let live_resources =
+                    dict.insert(
+                      live_resources,
+                      waiter.caller,
+                      LiveResource(resource: new_resource, monitor:),
+                    )
+                  actor.send(waiter.reply_to, Ok(new_resource))
+                  State(
+                    ..state,
+                    current_size: current_size + 1,
+                    live_resources:,
+                    waiting: new_waiting,
+                    selector:,
+                  )
+                  |> actor.continue
+                  |> actor.with_selector(selector)
+                }
+                Error(err) -> {
+                  log_resource_creation_error(state.log_errors, err)
+                  let selector = demonitor_process(selector, waiter.monitor)
+                  actor.send(
+                    waiter.reply_to,
+                    Error(CheckOutResourceCreateError(err)),
+                  )
+                  State(
+                    ..state,
+                    current_size:,
+                    live_resources:,
+                    waiting: new_waiting,
+                    selector:,
+                  )
+                  |> actor.continue
+                  |> actor.with_selector(selector)
+                }
+              }
+            }
+            Error(_) -> {
+              State(..state, current_size:, live_resources:, selector:)
+              |> actor.continue
+              |> actor.with_selector(selector)
+            }
+          }
         }
       }
-
-      State(
-        ..state,
-        current_size:,
-        resources: new_resources,
-        live_resources:,
-        selector:,
-      )
-      |> actor.continue
-      |> actor.with_selector(selector)
     }
     CheckOut(reply_to:, caller:) -> {
       // We always push to the back, so for FIFO, we pop front,
@@ -453,6 +600,74 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
         }
       }
     }
+    CheckOutBlocking(reply_to:, caller:) -> {
+      let get_result = case state.checkout_strategy {
+        FIFO -> deque.pop_front(state.resources)
+        LIFO -> deque.pop_back(state.resources)
+      }
+
+      let resource_result = case get_result {
+        Ok(#(resource, new_resources)) ->
+          Ok(#(resource, new_resources, state.current_size))
+        Error(_) -> {
+          case state.current_size < state.max_size {
+            True -> {
+              use resource <- result.try(
+                state.create_resource()
+                |> result.map_error(fn(err) {
+                  log_resource_creation_error(state.log_errors, err)
+                  CheckOutResourceCreateError(err)
+                }),
+              )
+              Ok(#(resource, state.resources, state.current_size + 1))
+            }
+            False -> Error(NoResourcesAvailable)
+          }
+        }
+      }
+
+      case resource_result {
+        Error(NoResourcesAvailable) -> {
+          let monitor = process.monitor(caller)
+          let selector =
+            state.selector
+            |> process.select_specific_monitor(monitor, WaiterDown)
+          let waiting_request = WaitingRequest(reply_to:, caller:, monitor:)
+          State(
+            ..state,
+            waiting: deque.push_back(state.waiting, waiting_request),
+            selector:,
+          )
+          |> actor.continue
+          |> actor.with_selector(selector)
+        }
+        Error(err) -> {
+          actor.send(reply_to, Error(err))
+          actor.continue(state)
+        }
+        Ok(#(resource, new_resources, new_current_size)) -> {
+          let #(monitor, selector) = monitor_process(state.selector, caller)
+
+          let live_resources =
+            dict.insert(
+              state.live_resources,
+              caller,
+              LiveResource(resource:, monitor:),
+            )
+
+          actor.send(reply_to, Ok(resource))
+          State(
+            ..state,
+            resources: new_resources,
+            current_size: new_current_size,
+            selector:,
+            live_resources:,
+          )
+          |> actor.continue
+          |> actor.with_selector(selector)
+        }
+      }
+    }
     PoolExit(exit_message) -> {
       // Don't clean up live resources, as they may be in use
       state.resources
@@ -468,6 +683,13 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
       }
     }
     Shutdown(reply_to:, force:) -> {
+      state.waiting
+      |> deque.to_list
+      |> list.each(fn(waiter) {
+        process.demonitor_process(waiter.monitor)
+        actor.send(waiter.reply_to, Error(PoolShuttingDown))
+      })
+
       case dict.size(state.live_resources), force {
         // No live resource, shut down
         0, _ -> {
@@ -502,47 +724,119 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
           // Demonitor the process
           let selector =
             demonitor_process(state.selector, live_resource.monitor)
+          let live_resources =
+            dict.delete(state.live_resources, process_down_pid)
 
           // Shutdown the old resource
           state.shutdown_resource(live_resource.resource)
+          let current_size = state.current_size - 1
 
-          let #(new_resources, new_current_size) = case
-            state.creation_strategy
-          {
-            // If we create lazily, just decrement the current size - a new resource
-            // will be created when required
-            Lazy -> #(state.resources, state.current_size - 1)
-            // Otherwise, create a new resource, warning if resource creation fails
-            Eager -> {
+          case deque.pop_front(state.waiting) {
+            Ok(#(waiter, new_waiting)) -> {
               case state.create_resource() {
-                // Size hasn't changed
-                Ok(resource) -> #(
-                  deque.push_back(state.resources, resource),
-                  state.current_size,
-                )
-                // Size has changed
-                Error(resource_create_error) -> {
-                  log_resource_creation_error(
-                    state.log_errors,
-                    resource_create_error,
+                Ok(new_resource) -> {
+                  let selector = demonitor_process(selector, waiter.monitor)
+                  let #(monitor, selector) =
+                    monitor_process(selector, waiter.caller)
+                  let live_resources =
+                    dict.insert(
+                      live_resources,
+                      waiter.caller,
+                      LiveResource(resource: new_resource, monitor:),
+                    )
+                  actor.send(waiter.reply_to, Ok(new_resource))
+                  State(
+                    ..state,
+                    current_size: current_size + 1,
+                    live_resources:,
+                    waiting: new_waiting,
+                    selector:,
+                    resources: state.resources,
                   )
-                  #(state.resources, state.current_size)
+                  |> actor.continue
+                  |> actor.with_selector(selector)
+                }
+                Error(err) -> {
+                  log_resource_creation_error(state.log_errors, err)
+                  let selector = demonitor_process(selector, waiter.monitor)
+                  actor.send(
+                    waiter.reply_to,
+                    Error(CheckOutResourceCreateError(err)),
+                  )
+                  State(
+                    ..state,
+                    current_size:,
+                    live_resources:,
+                    waiting: new_waiting,
+                    selector:,
+                    resources: state.resources,
+                  )
+                  |> actor.continue
+                  |> actor.with_selector(selector)
                 }
               }
             }
-          }
+            Error(_) -> {
+              let #(new_resources, new_current_size) = case
+                state.creation_strategy
+              {
+                // If we create lazily, just decrement the current size - a new resource
+                // will be created when required
+                Lazy -> #(state.resources, current_size)
+                // Otherwise, create a new resource, warning if resource creation fails
+                Eager -> {
+                  case state.create_resource() {
+                    // Size hasn't changed
+                    Ok(resource) -> #(
+                      deque.push_back(state.resources, resource),
+                      current_size + 1,
+                    )
+                    // Size has changed
+                    Error(resource_create_error) -> {
+                      log_resource_creation_error(
+                        state.log_errors,
+                        resource_create_error,
+                      )
+                      #(state.resources, current_size)
+                    }
+                  }
+                }
+              }
 
-          State(
-            ..state,
-            resources: new_resources,
-            current_size: new_current_size,
-            selector:,
-            live_resources: dict.delete(state.live_resources, process_down_pid),
-          )
-          |> actor.continue
-          |> actor.with_selector(selector)
+              State(
+                ..state,
+                resources: new_resources,
+                current_size: new_current_size,
+                selector:,
+                live_resources:,
+              )
+              |> actor.continue
+              |> actor.with_selector(selector)
+            }
+          }
         }
       }
+    }
+    WaiterDown(process_down) -> {
+      let assert process.ProcessDown(pid: process_down_pid, ..) = process_down
+
+      let #(new_waiting, monitors_to_remove) =
+        state.waiting
+        |> deque.to_list
+        |> list.partition(fn(waiter) { waiter.caller != process_down_pid })
+        |> fn(partitioned) {
+          let #(kept, removed) = partitioned
+          #(deque.from_list(kept), list.map(removed, fn(w) { w.monitor }))
+        }
+
+      let selector =
+        list.fold(monitors_to_remove, state.selector, fn(sel, mon) {
+          demonitor_process(sel, mon)
+        })
+
+      State(..state, waiting: new_waiting, selector:)
+      |> actor.continue
+      |> actor.with_selector(selector)
     }
   }
 }
@@ -598,6 +892,7 @@ fn actor_builder(
           checkout_strategy: builder.checkout_strategy,
           creation_strategy: builder.creation_strategy,
           live_resources: dict.new(),
+          waiting: deque.new(),
           selector:,
           current_size:,
           max_size: builder.size,
