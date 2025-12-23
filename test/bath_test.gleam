@@ -184,6 +184,167 @@ pub fn shutdown_function_doesnt_get_called_on_keep_test() {
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
 }
 
+pub fn apply_blocking_waits_for_resource_test() {
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  let result_subject = process.new_subject()
+
+  // First caller takes the only resource
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(200)
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  // Second caller uses apply_blocking - should wait and succeed
+  process.spawn(fn() {
+    let result =
+      bath.apply_blocking(pool, 5000, fn(r) { bath.keep() |> bath.returning(r) })
+    process.send(result_subject, result)
+  })
+
+  let assert Ok(Ok(10)) = process.receive(result_subject, 1000)
+  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+}
+
+pub fn apply_blocking_timeout_returns_error_test() {
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  // Take the only resource and hold it
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(1000)
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  // Try to get resource with short timeout - should timeout
+  let assert Error(bath.CheckoutTimedOut) =
+    bath.apply_blocking(pool, 100, fn(_) { bath.keep() })
+
+  let assert Ok(Nil) = bath.shutdown(pool, True, 1000)
+}
+
+pub fn apply_blocking_fifo_order_test() {
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  let order_subject = process.new_subject()
+
+  // First caller takes the only resource
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(300)
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  // Second and third callers queue up
+  process.spawn(fn() {
+    use _ <- bath.apply_blocking(pool, 5000)
+    process.send(order_subject, "second")
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  process.spawn(fn() {
+    use _ <- bath.apply_blocking(pool, 5000)
+    process.send(order_subject, "third")
+    bath.keep()
+  })
+
+  let assert Ok("second") = process.receive(order_subject, 2000)
+  let assert Ok("third") = process.receive(order_subject, 2000)
+  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+}
+
+pub fn apply_blocking_shutdown_rejects_waiters_test() {
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  let result_subject = process.new_subject()
+
+  // Take the only resource
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(500)
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  // Queue up a waiter
+  process.spawn(fn() {
+    let result = bath.apply_blocking(pool, 5000, fn(_) { bath.keep() })
+    process.send(result_subject, result)
+  })
+
+  process.sleep(50)
+
+  // Force shutdown while waiter is waiting
+  let assert Ok(Nil) = bath.shutdown(pool, True, 1000)
+
+  // Waiter should receive PoolShuttingDown error
+  let assert Ok(Error(bath.PoolShuttingDown)) =
+    process.receive(result_subject, 1000)
+}
+
+pub fn apply_blocking_waiter_crash_removes_from_queue_test() {
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  let result_subject = process.new_subject()
+
+  logging.set_level(logging.Critical)
+
+  // Take the only resource
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(300)
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  // First waiter will crash
+  process.spawn_unlinked(fn() {
+    use _ <- bath.apply_blocking(pool, 5000)
+    panic as "Waiter crashed!"
+  })
+
+  process.sleep(50)
+
+  // Second waiter should still get the resource
+  process.spawn(fn() {
+    let result =
+      bath.apply_blocking(pool, 5000, fn(r) { bath.keep() |> bath.returning(r) })
+    process.send(result_subject, result)
+  })
+
+  logging.configure()
+
+  // Second waiter should succeed
+  let assert Ok(Ok(10)) = process.receive(result_subject, 2000)
+  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+}
+
 // ----- Util tests  ----- //
 
 pub fn try_map_returning_succeeds_if_no_errors_test() {
