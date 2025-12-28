@@ -136,7 +136,6 @@ pub fn log_errors(
 pub type ApplyError {
   NoResourcesAvailable
   CheckOutResourceCreateError(error: String)
-  CheckoutTimedOut
   PoolShuttingDown
 }
 
@@ -304,9 +303,34 @@ pub fn apply(
 /// Like [`apply`](#apply), but blocks waiting for a resource if the pool is
 /// exhausted instead of returning `NoResourcesAvailable` immediately.
 ///
-/// The timeout covers both waiting in the queue and the call to the pool actor.
-/// If the timeout expires while waiting, `Error(CheckoutTimedOut)` is returned.
+/// The timeout covers both waiting in the queue and any internal pool operations.
+///
+/// ## Panics
+///
+/// This function will panic if the timeout expires before a resource becomes
+/// available.
+///
+/// If you need to handle timeouts gracefully, you can:
+/// - Use this function within a supervised process (let it crash, supervisor restarts)
+/// - Wrap the call in a separate process/task that you can monitor
+/// - Use the [`exception`](https://hexdocs.pm/exception) library's `rescue`
+///   function to convert the panic into a `Result`
+///
+/// ```gleam
+/// import exception
+///
+/// let result = exception.rescue(fn() {
+///   bath.apply_blocking(pool, 1000, fn(resource) {
+///     // use resource...
+///     bath.keep()
+///   })
+/// })
+/// // result: Result(Result(a, ApplyError), Exception)
+/// ```
+///
 /// If the pool shuts down while waiting, `Error(PoolShuttingDown)` is returned.
+///
+/// ## Example
 ///
 /// ```gleam
 /// let assert Ok(pool) =
@@ -314,7 +338,7 @@ pub fn apply(
 ///   |> bath.size(1)
 ///   |> bath.start(1000)
 ///
-/// // This will block until a resource is available or timeout
+/// // This will block until a resource is available or panic on timeout
 /// use resource <- bath.apply_blocking(pool, 5000)
 ///
 /// // Do stuff with resource...
@@ -328,44 +352,20 @@ pub fn apply_blocking(
   next next: fn(resource_type) -> Next(result_type),
 ) -> Result(result_type, ApplyError) {
   let self = process.self()
-  let checkout_result = blocking_checkout(pool, self, timeout)
+  use resource <- result.try(
+    process.call(pool, timeout, CheckOutBlocking(_, caller: self)),
+  )
 
-  case checkout_result {
-    Error(err) -> Error(err)
-    Ok(resource) -> {
-      let next_action = next(resource)
+  let next_action = next(resource)
 
-      let #(usage_result, next_action) = case next_action {
-        Keep(return) -> #(return, Keep(Nil))
-        Discard(return) -> #(return, Discard(Nil))
-      }
-
-      check_in(pool, resource, self, next_action)
-
-      Ok(usage_result)
-    }
+  let #(usage_result, next_action) = case next_action {
+    Keep(return) -> #(return, Keep(Nil))
+    Discard(return) -> #(return, Discard(Nil))
   }
-}
 
-/// Internal function to perform blocking checkout with graceful timeout handling.
-/// Unlike process.call, this returns an error on timeout instead of panicking.
-fn blocking_checkout(
-  pool: process.Subject(Msg(resource_type)),
-  caller: Pid,
-  timeout: Int,
-) -> Result(resource_type, ApplyError) {
-  let reply_subject = process.new_subject()
-  process.send(pool, CheckOutBlocking(reply_to: reply_subject, caller:))
+  check_in(pool, resource, self, next_action)
 
-  let selector =
-    process.new_selector()
-    |> process.select(reply_subject)
-
-  case process.selector_receive(selector, timeout) {
-    Error(Nil) -> Error(CheckoutTimedOut)
-    Ok(Error(err)) -> Error(err)
-    Ok(Ok(resource)) -> Ok(resource)
-  }
+  Ok(usage_result)
 }
 
 /// Shut down the pool, calling the shutdown function on each

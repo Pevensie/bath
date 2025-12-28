@@ -212,11 +212,13 @@ pub fn apply_blocking_waits_for_resource_test() {
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
 }
 
-pub fn apply_blocking_timeout_returns_error_test() {
+pub fn apply_blocking_timeout_panics_test() {
   let assert Ok(pool) =
     bath.new(fn() { Ok(10) })
     |> bath.size(1)
     |> bath.start(1000)
+
+  let result_subject = process.new_subject()
 
   // Take the only resource and hold it
   process.spawn(fn() {
@@ -227,9 +229,21 @@ pub fn apply_blocking_timeout_returns_error_test() {
 
   process.sleep(50)
 
-  // Try to get resource with short timeout - should timeout
-  let assert Error(bath.CheckoutTimedOut) =
-    bath.apply_blocking(pool, 100, fn(_) { bath.keep() })
+  // Try to get resource with short timeout in separate process
+  // It should panic (process dies)
+  let pid =
+    process.spawn_unlinked(fn() {
+      bath.apply_blocking(pool, 100, fn(_) { bath.keep() })
+      |> Ok
+      |> process.send(result_subject, _)
+    })
+
+  let monitor = process.monitor(pid)
+
+  let assert Ok(process.ProcessDown(..)) =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(down) { down })
+    |> process.selector_receive(500)
 
   let assert Ok(Nil) = bath.shutdown(pool, True, 1000)
 }
