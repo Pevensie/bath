@@ -786,12 +786,12 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
                 // Otherwise, create a new resource, warning if resource creation fails
                 Eager -> {
                   case state.create_resource() {
-                    // Size hasn't changed
+                    // Resource replaced: +1 offsets earlier decrement, net pool size unchanged
                     Ok(resource) -> #(
                       deque.push_back(state.resources, resource),
                       current_size + 1,
                     )
-                    // Size has changed
+                    // Resource lost: pool size decreased by 1
                     Error(resource_create_error) -> {
                       log_resource_creation_error(
                         state.log_errors,
