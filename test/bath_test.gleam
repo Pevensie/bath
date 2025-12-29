@@ -359,6 +359,75 @@ pub fn apply_blocking_waiter_crash_removes_from_queue_test() {
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
 }
 
+pub fn lazy_defers_resource_creation_on_crash_test() {
+  // Track how many times create_resource is called
+  let counter = process.new_subject()
+
+  let assert Ok(pool) =
+    bath.new(fn() {
+      process.send(counter, Nil)
+      Ok(10)
+    })
+    |> bath.size(1)
+    |> bath.creation_strategy(bath.Lazy)
+    |> bath.start(1000)
+
+  // Lazy: no resource created at start
+  let assert Error(Nil) = process.receive(counter, 100)
+
+  // Checkout creates resource on demand
+  process.spawn_unlinked(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(100)
+    panic as "Holder crashed"
+  })
+
+  // First creation happens on checkout
+  let assert Ok(Nil) = process.receive(counter, 500)
+
+  // Wait for crash to be processed
+  process.sleep(200)
+
+  // Lazy should NOT create replacement when no waiters
+  let assert Error(Nil) = process.receive(counter, 50)
+  let assert Ok(Nil) = bath.shutdown(pool, True, 1000)
+}
+
+pub fn eager_replaces_resource_on_crash_test() {
+  // Track how many times create_resource is called
+  let counter = process.new_subject()
+
+  let assert Ok(pool) =
+    bath.new(fn() {
+      process.send(counter, Nil)
+      Ok(10)
+    })
+    |> bath.size(1)
+    |> bath.creation_strategy(bath.Eager)
+    |> bath.start(1000)
+
+  // Eager: resource created at start
+  let assert Ok(Nil) = process.receive(counter, 500)
+
+  // Checkout uses existing resource (no new creation)
+  process.spawn_unlinked(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(200)
+    panic as "Holder crashed"
+  })
+
+  // Wait for checkout to complete, then verify no new creation yet
+  process.sleep(100)
+  let assert Error(Nil) = process.receive(counter, 50)
+
+  // Wait for crash to be processed
+  process.sleep(100)
+
+  // Eager SHOULD create replacement when no waiters
+  let assert Ok(Nil) = process.receive(counter, 500)
+  let assert Ok(Nil) = bath.shutdown(pool, True, 1000)
+}
+
 // ----- Util tests  ----- //
 
 pub fn try_map_returning_succeeds_if_no_errors_test() {
