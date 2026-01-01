@@ -729,7 +729,6 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
 
           // Shutdown the old resource
           state.shutdown_resource(live_resource.resource)
-          let current_size = state.current_size - 1
 
           case deque.pop_front(state.waiting) {
             Ok(#(waiter, new_waiting)) -> {
@@ -747,7 +746,7 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
                   actor.send(waiter.reply_to, Ok(new_resource))
                   State(
                     ..state,
-                    current_size: current_size + 1,
+                    current_size: state.current_size,
                     live_resources:,
                     waiting: new_waiting,
                     selector:,
@@ -765,7 +764,7 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
                   )
                   State(
                     ..state,
-                    current_size:,
+                    current_size: state.current_size - 1,
                     live_resources:,
                     waiting: new_waiting,
                     selector:,
@@ -782,22 +781,22 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
               {
                 // If we create lazily, just decrement the current size - a new resource
                 // will be created when required
-                Lazy -> #(state.resources, current_size)
+                Lazy -> #(state.resources, state.current_size - 1)
                 // Otherwise, create a new resource, warning if resource creation fails
                 Eager -> {
                   case state.create_resource() {
-                    // Resource replaced: +1 offsets earlier decrement, net pool size unchanged
+                    // Size hasn't changed
                     Ok(resource) -> #(
                       deque.push_back(state.resources, resource),
-                      current_size + 1,
+                      state.current_size,
                     )
-                    // Resource lost: pool size decreased by 1
+                    // Size has changed
                     Error(resource_create_error) -> {
                       log_resource_creation_error(
                         state.log_errors,
                         resource_create_error,
                       )
-                      #(state.resources, current_size)
+                      #(state.resources, state.current_size - 1)
                     }
                   }
                 }
