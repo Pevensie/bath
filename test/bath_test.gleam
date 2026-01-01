@@ -184,6 +184,250 @@ pub fn shutdown_function_doesnt_get_called_on_keep_test() {
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
 }
 
+pub fn apply_blocking_waits_for_resource_test() {
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  let result_subject = process.new_subject()
+
+  // First caller takes the only resource
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(200)
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  // Second caller uses apply_blocking - should wait and succeed
+  process.spawn(fn() {
+    let result =
+      bath.apply_blocking(pool, 5000, fn(r) { bath.keep() |> bath.returning(r) })
+    process.send(result_subject, result)
+  })
+
+  let assert Ok(Ok(10)) = process.receive(result_subject, 1000)
+  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+}
+
+pub fn apply_blocking_timeout_panics_test() {
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  let result_subject = process.new_subject()
+
+  // Take the only resource and hold it
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(1000)
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  // Try to get resource with short timeout in separate process
+  // It should panic (process dies)
+  let pid =
+    process.spawn_unlinked(fn() {
+      bath.apply_blocking(pool, 100, fn(_) { bath.keep() })
+      |> Ok
+      |> process.send(result_subject, _)
+    })
+
+  let monitor = process.monitor(pid)
+
+  let assert Ok(process.ProcessDown(..)) =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(down) { down })
+    |> process.selector_receive(500)
+
+  let assert Ok(Nil) = bath.shutdown(pool, True, 1000)
+}
+
+pub fn apply_blocking_fifo_order_test() {
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  let order_subject = process.new_subject()
+
+  // First caller takes the only resource
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(300)
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  // Second and third callers queue up
+  process.spawn(fn() {
+    use _ <- bath.apply_blocking(pool, 5000)
+    process.send(order_subject, "second")
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  process.spawn(fn() {
+    use _ <- bath.apply_blocking(pool, 5000)
+    process.send(order_subject, "third")
+    bath.keep()
+  })
+
+  let assert Ok("second") = process.receive(order_subject, 2000)
+  let assert Ok("third") = process.receive(order_subject, 2000)
+  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+}
+
+pub fn apply_blocking_shutdown_rejects_waiters_test() {
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  let result_subject = process.new_subject()
+
+  // Take the only resource
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(500)
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  // Queue up a waiter
+  process.spawn(fn() {
+    let result = bath.apply_blocking(pool, 5000, fn(_) { bath.keep() })
+    process.send(result_subject, result)
+  })
+
+  process.sleep(50)
+
+  // Force shutdown while waiter is waiting
+  let assert Ok(Nil) = bath.shutdown(pool, True, 1000)
+
+  // Waiter should receive PoolShuttingDown error
+  let assert Ok(Error(bath.PoolShuttingDown)) =
+    process.receive(result_subject, 1000)
+}
+
+pub fn apply_blocking_waiter_crash_removes_from_queue_test() {
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  let result_subject = process.new_subject()
+
+  logging.set_level(logging.Critical)
+
+  // Take the only resource
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(300)
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  // First waiter will crash
+  process.spawn_unlinked(fn() {
+    use _ <- bath.apply_blocking(pool, 5000)
+    panic as "Waiter crashed!"
+  })
+
+  process.sleep(50)
+
+  // Second waiter should still get the resource
+  process.spawn(fn() {
+    let result =
+      bath.apply_blocking(pool, 5000, fn(r) { bath.keep() |> bath.returning(r) })
+    process.send(result_subject, result)
+  })
+
+  logging.configure()
+
+  // Second waiter should succeed
+  let assert Ok(Ok(10)) = process.receive(result_subject, 2000)
+  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+}
+
+pub fn lazy_defers_resource_creation_on_crash_test() {
+  // Track how many times create_resource is called
+  let counter = process.new_subject()
+
+  let assert Ok(pool) =
+    bath.new(fn() {
+      process.send(counter, Nil)
+      Ok(10)
+    })
+    |> bath.size(1)
+    |> bath.creation_strategy(bath.Lazy)
+    |> bath.start(1000)
+
+  // Lazy: no resource created at start
+  let assert Error(Nil) = process.receive(counter, 100)
+
+  // Checkout creates resource on demand
+  process.spawn_unlinked(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(100)
+    panic as "Holder crashed"
+  })
+
+  // First creation happens on checkout
+  let assert Ok(Nil) = process.receive(counter, 500)
+
+  // Wait for crash to be processed
+  process.sleep(200)
+
+  // Lazy should NOT create replacement when no waiters
+  let assert Error(Nil) = process.receive(counter, 50)
+  let assert Ok(Nil) = bath.shutdown(pool, True, 1000)
+}
+
+pub fn eager_replaces_resource_on_crash_test() {
+  // Track how many times create_resource is called
+  let counter = process.new_subject()
+
+  let assert Ok(pool) =
+    bath.new(fn() {
+      process.send(counter, Nil)
+      Ok(10)
+    })
+    |> bath.size(1)
+    |> bath.creation_strategy(bath.Eager)
+    |> bath.start(1000)
+
+  // Eager: resource created at start
+  let assert Ok(Nil) = process.receive(counter, 500)
+
+  // Checkout uses existing resource (no new creation)
+  process.spawn_unlinked(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(200)
+    panic as "Holder crashed"
+  })
+
+  // Wait for checkout to complete, then verify no new creation yet
+  process.sleep(100)
+  let assert Error(Nil) = process.receive(counter, 50)
+
+  // Wait for crash to be processed
+  process.sleep(100)
+
+  // Eager SHOULD create replacement when no waiters
+  let assert Ok(Nil) = process.receive(counter, 500)
+  let assert Ok(Nil) = bath.shutdown(pool, True, 1000)
+}
+
 // ----- Util tests  ----- //
 
 pub fn try_map_returning_succeeds_if_no_errors_test() {
