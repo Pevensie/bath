@@ -359,6 +359,45 @@ pub fn apply_blocking_waiter_crash_removes_from_queue_test() {
   let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
 }
 
+pub fn apply_blocking_with_discard_creates_new_resource_for_waiter_test() {
+  let creation_counter = process.new_subject()
+
+  let assert Ok(pool) =
+    bath.new(fn() {
+      process.send(creation_counter, Nil)
+      Ok(10)
+    })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  let result_subject = process.new_subject()
+
+  // First caller takes the only resource and discards it
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(200)
+    bath.discard()
+  })
+
+  process.sleep(50)
+
+  // Second caller blocks waiting
+  process.spawn(fn() {
+    let result =
+      bath.apply_blocking(pool, 5000, fn(r) { bath.keep() |> bath.returning(r) })
+    process.send(result_subject, result)
+  })
+
+  // Waiter should get a freshly created resource after the discard
+  let assert Ok(Ok(10)) = process.receive(result_subject, 1000)
+
+  // Drain the creation counter: one for original checkout, one for the waiter
+  let assert Ok(Nil) = process.receive(creation_counter, 100)
+  let assert Ok(Nil) = process.receive(creation_counter, 100)
+
+  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+}
+
 pub fn lazy_defers_resource_creation_on_crash_test() {
   // Track how many times create_resource is called
   let counter = process.new_subject()
