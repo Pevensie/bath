@@ -313,20 +313,6 @@ pub fn apply(
 /// If you need to handle timeouts gracefully, you can:
 /// - Use this function within a supervised process (let it crash, supervisor restarts)
 /// - Wrap the call in a separate process/task that you can monitor
-/// - Use the [`exception`](https://hexdocs.pm/exception) library's `rescue`
-///   function to convert the panic into a `Result`
-///
-/// ```gleam
-/// import exception
-///
-/// let result = exception.rescue(fn() {
-///   bath.apply_blocking(pool, 1000, fn(resource) {
-///     // use resource...
-///     bath.keep()
-///   })
-/// })
-/// // result: Result(Result(a, ApplyError), Exception)
-/// ```
 ///
 /// If the pool shuts down while waiting, `Error(PoolShuttingDown)` is returned.
 ///
@@ -453,23 +439,20 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
 
       case next {
         Keep(_) -> {
-          case deque.pop_front(state.waiting) {
-            Ok(#(waiter, new_waiting)) -> {
-              let selector = demonitor_process(selector, waiter.monitor)
-              let #(monitor, selector) =
-                monitor_process(selector, waiter.caller)
-              let live_resources =
-                dict.insert(
-                  live_resources,
-                  waiter.caller,
-                  LiveResource(resource:, monitor:),
-                )
-              actor.send(waiter.reply_to, Ok(resource))
-              State(..state, live_resources:, waiting: new_waiting, selector:)
+          case
+            serve_next_waiter(
+              state,
+              Ok(resource),
+              live_resources,
+              selector,
+              state.current_size,
+            )
+          {
+            Served(live_resources:, waiting:, selector:, ..) ->
+              State(..state, live_resources:, waiting:, selector:)
               |> actor.continue
               |> actor.with_selector(selector)
-            }
-            Error(_) -> {
+            NoneWaiting ->
               State(
                 ..state,
                 resources: deque.push_back(state.resources, resource),
@@ -478,60 +461,47 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
               )
               |> actor.continue
               |> actor.with_selector(selector)
-            }
+            ServeFailed(..) ->
+              // Cannot happen: we passed Ok(resource), so creation is never attempted
+              panic as "unreachable: serve_next_waiter with Ok resource cannot fail"
           }
         }
         Discard(_) -> {
           state.shutdown_resource(resource)
           let current_size = state.current_size - 1
-          case deque.pop_front(state.waiting) {
-            Ok(#(waiter, new_waiting)) -> {
-              case state.create_resource() {
-                Ok(new_resource) -> {
-                  let selector = demonitor_process(selector, waiter.monitor)
-                  let #(monitor, selector) =
-                    monitor_process(selector, waiter.caller)
-                  let live_resources =
-                    dict.insert(
-                      live_resources,
-                      waiter.caller,
-                      LiveResource(resource: new_resource, monitor:),
-                    )
-                  actor.send(waiter.reply_to, Ok(new_resource))
-                  State(
-                    ..state,
-                    current_size: current_size + 1,
-                    live_resources:,
-                    waiting: new_waiting,
-                    selector:,
-                  )
-                  |> actor.continue
-                  |> actor.with_selector(selector)
-                }
-                Error(err) -> {
-                  log_resource_creation_error(state.log_errors, err)
-                  let selector = demonitor_process(selector, waiter.monitor)
-                  actor.send(
-                    waiter.reply_to,
-                    Error(CheckOutResourceCreateError(err)),
-                  )
-                  State(
-                    ..state,
-                    current_size:,
-                    live_resources:,
-                    waiting: new_waiting,
-                    selector:,
-                  )
-                  |> actor.continue
-                  |> actor.with_selector(selector)
-                }
-              }
-            }
-            Error(_) -> {
+          case
+            serve_next_waiter(
+              state,
+              Error(Nil),
+              live_resources,
+              selector,
+              current_size,
+            )
+          {
+            Served(live_resources:, waiting:, selector:, current_size:) ->
+              State(
+                ..state,
+                current_size:,
+                live_resources:,
+                waiting:,
+                selector:,
+              )
+              |> actor.continue
+              |> actor.with_selector(selector)
+            ServeFailed(waiting:, selector:, current_size:) ->
+              State(
+                ..state,
+                current_size:,
+                live_resources:,
+                waiting:,
+                selector:,
+              )
+              |> actor.continue
+              |> actor.with_selector(selector)
+            NoneWaiting ->
               State(..state, current_size:, live_resources:, selector:)
               |> actor.continue
               |> actor.with_selector(selector)
-            }
           }
         }
       }
@@ -730,73 +700,63 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
           // Shutdown the old resource
           state.shutdown_resource(live_resource.resource)
 
-          case deque.pop_front(state.waiting) {
-            Ok(#(waiter, new_waiting)) -> {
-              case state.create_resource() {
-                Ok(new_resource) -> {
-                  let selector = demonitor_process(selector, waiter.monitor)
-                  let #(monitor, selector) =
-                    monitor_process(selector, waiter.caller)
-                  let live_resources =
-                    dict.insert(
-                      live_resources,
-                      waiter.caller,
-                      LiveResource(resource: new_resource, monitor:),
-                    )
-                  actor.send(waiter.reply_to, Ok(new_resource))
-                  State(
-                    ..state,
-                    current_size: state.current_size,
-                    live_resources:,
-                    waiting: new_waiting,
-                    selector:,
-                    resources: state.resources,
-                  )
-                  |> actor.continue
-                  |> actor.with_selector(selector)
-                }
-                Error(err) -> {
-                  log_resource_creation_error(state.log_errors, err)
-                  let selector = demonitor_process(selector, waiter.monitor)
-                  actor.send(
-                    waiter.reply_to,
-                    Error(CheckOutResourceCreateError(err)),
-                  )
-                  State(
-                    ..state,
-                    current_size: state.current_size - 1,
-                    live_resources:,
-                    waiting: new_waiting,
-                    selector:,
-                    resources: state.resources,
-                  )
-                  |> actor.continue
-                  |> actor.with_selector(selector)
-                }
-              }
-            }
-            Error(_) -> {
+          // current_size is unchanged here: we shutdown one resource above but
+          // haven't decremented yet — serve_next_waiter will create a new one
+          // if a waiter exists (net zero change), or we handle the no-waiter
+          // case below with Eager/Lazy logic.
+          let current_size = state.current_size
+          case
+            serve_next_waiter(
+              state,
+              Error(Nil),
+              live_resources,
+              selector,
+              // Pass current_size - 1 because we destroyed the old resource.
+              // If creation succeeds, serve_next_waiter adds 1 back (net zero).
+              current_size - 1,
+            )
+          {
+            Served(live_resources:, waiting:, selector:, current_size:) ->
+              State(
+                ..state,
+                current_size:,
+                live_resources:,
+                waiting:,
+                selector:,
+              )
+              |> actor.continue
+              |> actor.with_selector(selector)
+            ServeFailed(waiting:, selector:, current_size:) ->
+              State(
+                ..state,
+                current_size:,
+                live_resources:,
+                waiting:,
+                selector:,
+              )
+              |> actor.continue
+              |> actor.with_selector(selector)
+            NoneWaiting -> {
               let #(new_resources, new_current_size) = case
                 state.creation_strategy
               {
                 // If we create lazily, just decrement the current size - a new resource
                 // will be created when required
-                Lazy -> #(state.resources, state.current_size - 1)
+                Lazy -> #(state.resources, current_size - 1)
                 // Otherwise, create a new resource, warning if resource creation fails
                 Eager -> {
                   case state.create_resource() {
-                    // Size hasn't changed
+                    // Destroyed one, created one — net zero change to size
                     Ok(resource) -> #(
                       deque.push_back(state.resources, resource),
-                      state.current_size,
+                      current_size,
                     )
-                    // Size has changed
                     Error(resource_create_error) -> {
                       log_resource_creation_error(
                         state.log_errors,
                         resource_create_error,
                       )
-                      #(state.resources, state.current_size - 1)
+                      #(state.resources, current_size - 1)
                     }
                   }
                 }
@@ -914,6 +874,79 @@ fn actor_builder(
 }
 
 // ----- Utils ----- //
+
+/// Result of attempting to serve a waiting request from the queue.
+type ServeResult(resource_type) {
+  /// A waiter was served successfully. Contains the updated state fields.
+  Served(
+    live_resources: LiveResources(resource_type),
+    waiting: deque.Deque(WaitingRequest(resource_type)),
+    selector: process.Selector(Msg(resource_type)),
+    current_size: Int,
+  )
+  /// A waiter was found but resource creation failed.
+  ServeFailed(
+    waiting: deque.Deque(WaitingRequest(resource_type)),
+    selector: process.Selector(Msg(resource_type)),
+    current_size: Int,
+  )
+  /// No waiters in the queue.
+  NoneWaiting
+}
+
+/// Try to pop the next waiter from the queue and serve them a resource.
+///
+/// If `resource` is `Ok`, that resource is handed to the waiter directly.
+/// If `resource` is `Error`, a new resource is created for the waiter.
+///
+/// `current_size` should reflect the pool size *before* this resource is
+/// accounted for (i.e. after the old resource was removed/shutdown).
+fn serve_next_waiter(
+  state: State(resource_type),
+  resource: Result(resource_type, Nil),
+  live_resources: LiveResources(resource_type),
+  selector: process.Selector(Msg(resource_type)),
+  current_size: Int,
+) -> ServeResult(resource_type) {
+  case deque.pop_front(state.waiting) {
+    Error(_) -> NoneWaiting
+    Ok(#(waiter, new_waiting)) -> {
+      let resource_result = case resource {
+        Ok(r) -> Ok(#(r, current_size))
+        Error(_) ->
+          case state.create_resource() {
+            Ok(r) -> Ok(#(r, current_size + 1))
+            Error(err) -> Error(err)
+          }
+      }
+      case resource_result {
+        Ok(#(r, new_current_size)) -> {
+          let selector = demonitor_process(selector, waiter.monitor)
+          let #(monitor, selector) = monitor_process(selector, waiter.caller)
+          let live_resources =
+            dict.insert(
+              live_resources,
+              waiter.caller,
+              LiveResource(resource: r, monitor:),
+            )
+          actor.send(waiter.reply_to, Ok(r))
+          Served(
+            live_resources:,
+            waiting: new_waiting,
+            selector:,
+            current_size: new_current_size,
+          )
+        }
+        Error(err) -> {
+          log_resource_creation_error(state.log_errors, err)
+          let selector = demonitor_process(selector, waiter.monitor)
+          actor.send(waiter.reply_to, Error(CheckOutResourceCreateError(err)))
+          ServeFailed(waiting: new_waiting, selector:, current_size:)
+        }
+      }
+    }
+  }
+}
 
 fn monitor_process(selector: process.Selector(Msg(resource_type)), pid: Pid) {
   let monitor = process.monitor(pid)
