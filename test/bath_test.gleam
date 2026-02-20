@@ -318,6 +318,42 @@ pub fn apply_blocking_shutdown_rejects_waiters_test() {
     process.receive(result_subject, 1000)
 }
 
+pub fn apply_blocking_failed_shutdown_keeps_waiters_test() {
+  let assert Ok(pool) =
+    bath.new(fn() { Ok(10) })
+    |> bath.size(1)
+    |> bath.start(1000)
+
+  let result_subject = process.new_subject()
+
+  // Take the only resource and hold it long enough for shutdown attempt
+  process.spawn(fn() {
+    use _ <- bath.apply(pool, 5000)
+    process.sleep(400)
+    bath.keep()
+  })
+
+  process.sleep(50)
+
+  // Queue up a waiter
+  process.spawn(fn() {
+    let result =
+      bath.apply_blocking(pool, 5000, fn(r) { bath.keep() |> bath.returning(r) })
+    process.send(result_subject, result)
+  })
+
+  process.sleep(50)
+
+  // Non-force shutdown should fail and keep waiter queued
+  let assert Error(bath.ResourcesInUse) = bath.shutdown(pool, False, 1000)
+  let assert Error(Nil) = process.receive(result_subject, 100)
+
+  // Holder checks in; waiter should now succeed
+  let assert Ok(Ok(10)) = process.receive(result_subject, 2000)
+
+  let assert Ok(Nil) = bath.shutdown(pool, False, 1000)
+}
+
 pub fn apply_blocking_waiter_crash_removes_from_queue_test() {
   let assert Ok(pool) =
     bath.new(fn() { Ok(10) })

@@ -653,16 +653,11 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
       }
     }
     Shutdown(reply_to:, force:) -> {
-      state.waiting
-      |> deque.to_list
-      |> list.each(fn(waiter) {
-        process.demonitor_process(waiter.monitor)
-        actor.send(waiter.reply_to, Error(PoolShuttingDown))
-      })
-
       case dict.size(state.live_resources), force {
         // No live resource, shut down
         0, _ -> {
+          reject_waiters(state.waiting)
+
           state.resources
           |> deque.to_list
           |> list.each(state.shutdown_resource)
@@ -672,6 +667,8 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
         }
         _, True -> {
           // Force shutdown
+          reject_waiters(state.waiting)
+
           actor.send(reply_to, Ok(Nil))
           actor.stop()
         }
@@ -798,6 +795,15 @@ fn handle_pool_message(state: State(resource_type), msg: Msg(resource_type)) {
       |> actor.with_selector(selector)
     }
   }
+}
+
+fn reject_waiters(waiting: deque.Deque(WaitingRequest(resource_type))) -> Nil {
+  waiting
+  |> deque.to_list
+  |> list.each(fn(waiter) {
+    process.demonitor_process(waiter.monitor)
+    actor.send(waiter.reply_to, Error(PoolShuttingDown))
+  })
 }
 
 /// Create the resources for a pool, returning a deque of resources and the number of
