@@ -1,5 +1,5 @@
 name = "bath"
-version = "5.0.0"
+version = "6.0.0"
 description = "A resource pool for Gleam!"
 licences = ["MIT"]
 repository = { type = "github", user = "Pevensie", repo = "bath" }

@@ -1,5 +1,10 @@
 # Changelog
 
+## v6.0.0 - 2026-02-20
+
+- Added the `apply_blocking` function (thanks to [jtdowney](https://github.com/jtdowney)!).
+  - New error variant, hence the breaking change.
+
 ## v5.0.0 - 2025-06-22
 
 - Remove the `Pool` type in favour of `process.Subject(bath.Msg(msg))`. It was just a
